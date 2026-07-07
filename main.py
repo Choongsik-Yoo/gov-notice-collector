@@ -2,18 +2,19 @@
 """
 지원사업 공고 자동 수집 -> 노션 BizinfoData DB
   1단계: 기업마당 공식 API
-  2단계: NTIS 국가R&D통합공고 RSS
+  2단계: NTIS 국가R&D통합공고 (Ajax→HTML→RSS 3중 폴백)
 
 환경변수:
   NOTION_API_KEY     : 노션 통합 시크릿 키
   NOTION_DATABASE_ID : BizinfoData DB ID
-  BIZINFO_API_KEY    : 기업마당 API 인증키 (crtfcKey)
+  BIZINFO_API_KEY    : 기업마당 API 인증키
 """
 
 import os, re, sys, time
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 
 # ------------------------------------------------------------------
 # 설정
@@ -28,14 +29,25 @@ FETCH_COUNT = int(os.environ.get("FETCH_COUNT", "300"))
 BIZINFO_URL  = "https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do"
 BIZINFO_BASE = "https://www.bizinfo.go.kr"
 
-# NTIS 국가R&D통합공고 RSS (공식 제공, 인증키 불필요)
-NTIS_RSS_URL = "https://www.ntis.go.kr/rndgate/eg/un/ra/rss.do"
-NTIS_BASE    = "https://www.ntis.go.kr"
+NTIS_BASE      = "https://www.ntis.go.kr"
+NTIS_AJAX_URL  = "https://www.ntis.go.kr/rndgate/eg/un/ra/selectUnRaListAjax.do"
+NTIS_LIST_URL  = "https://www.ntis.go.kr/rndgate/eg/un/ra/mng.do"
+NTIS_RSS_URLS  = [
+    "https://www.ntis.go.kr/rndgate/eg/un/ra/rss.do",
+    "https://www.ntis.go.kr/ThMain.do?rss=Y",
+]
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
+}
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/126.0.0.0 Safari/537.36"),
+    "Accept-Language": "ko-KR,ko;q=0.9",
+    "Referer": "https://www.ntis.go.kr/",
 }
 
 REGIONS = [
@@ -43,19 +55,6 @@ REGIONS = [
     "경기","강원","충북","충남","전북","전남","경북","경남","제주",
 ]
 FIELD_NAMES = ["금융","기술","인력","수출","내수","창업","경영","기타"]
-
-BROWSER_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/126.0.0.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-}
-RSS_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/126.0.0.0 Safari/537.36"),
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
-}
 
 MAX_RETRY  = 3
 RETRY_WAIT = 20
@@ -72,30 +71,28 @@ def pick(item, *keys):
     return ""
 
 def parse_date(text):
-    if not text:
-        return ""
-    m = re.search(r"(\d{4})[-./년\s]?(\d{2})[-./월\s]?(\d{2})", text)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    return ""
+    if not text: return ""
+    m = re.search(r"(\d{4})[-./년\s]?(\d{2})[-./월\s]?(\d{2})", str(text))
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
 
 def parse_deadline(text):
-    if not text:
-        return ""
-    parts = re.split(r"[~∼\-–]", text)
+    if not text: return ""
+    parts = re.split(r"[~∼]", text)
     end = parse_date(parts[-1]) if parts else ""
     return end if end else text.strip()
 
 def detect_region(*texts):
     joined = " ".join(t for t in texts if t)
     for r in REGIONS:
-        if r in joined:
-            return r
+        if r in joined: return r
     return "전국"
 
+def detect_fields(*texts):
+    joined = " ".join(t for t in texts if t)
+    return [f for f in FIELD_NAMES if f in joined] or ["기타"]
+
 def is_recent(notice):
-    if not notice["reg_date"]:
-        return True
+    if not notice.get("reg_date"): return True
     try:
         d = datetime.strptime(notice["reg_date"], "%Y-%m-%d")
         return d >= datetime.now() - timedelta(days=DAYS_BACK)
@@ -104,7 +101,7 @@ def is_recent(notice):
 
 
 # ------------------------------------------------------------------
-# 노션 API 공통 (재시도 포함)
+# 노션 API (재시도 포함)
 # ------------------------------------------------------------------
 def notion_post(url, payload):
     last_err = None
@@ -113,13 +110,12 @@ def notion_post(url, payload):
             resp = requests.post(url, headers=NOTION_HEADERS,
                                  json=payload, timeout=60)
             if resp.status_code in (429, 500, 502, 503):
-                raise requests.exceptions.ConnectionError(
-                    f"노션 일시 오류 {resp.status_code}")
+                raise requests.exceptions.ConnectionError(f"노션 오류 {resp.status_code}")
             return resp
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as e:
             last_err = e
-            print(f"  [재시도 {attempt}/{MAX_RETRY}] 노션 접속 지연 {RETRY_WAIT}초 대기...")
+            print(f"  [재시도 {attempt}/{MAX_RETRY}] 노션 지연 {RETRY_WAIT}초 대기...")
             time.sleep(RETRY_WAIT)
     raise last_err
 
@@ -143,11 +139,11 @@ def get_existing_ids():
 
 def create_page(n):
     props = {
-        "제목":    {"title":       [{"text": {"content": n["title"][:200]}}]},
-        "공고ID":  {"rich_text":   [{"text": {"content": n["id"]}}]},
-        "지역":    {"select":      {"name": n["region"]}},
-        "지원분야":{"multi_select":[{"name": f} for f in n["fields"]]},
-        "출처":    {"multi_select":[{"name": n["source"]}]},
+        "제목":     {"title":       [{"text": {"content": n["title"][:200]}}]},
+        "공고ID":   {"rich_text":   [{"text": {"content": n["id"]}}]},
+        "지역":     {"select":      {"name": n["region"]}},
+        "지원분야": {"multi_select":[{"name": f} for f in n["fields"]]},
+        "출처":     {"multi_select":[{"name": n["source"]}]},
     }
     if n.get("org"):
         props["공고기관"] = {"rich_text": [{"text": {"content": n["org"][:200]}}]}
@@ -172,11 +168,8 @@ def create_page(n):
 # 1단계: 기업마당 API
 # ==================================================================
 def fetch_bizinfo():
-    params = {
-        "crtfcKey":  BIZINFO_API_KEY,
-        "dataType":  "json",
-        "searchCnt": str(FETCH_COUNT),
-    }
+    params = {"crtfcKey": BIZINFO_API_KEY, "dataType": "json",
+              "searchCnt": str(FETCH_COUNT)}
     last_err = None
     for attempt in range(1, MAX_RETRY + 1):
         try:
@@ -187,12 +180,11 @@ def fetch_bizinfo():
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as e:
             last_err = e
-            print(f"  [재시도 {attempt}/{MAX_RETRY}] 기업마당 접속 지연 {RETRY_WAIT}초 대기...")
+            print(f"  [재시도 {attempt}/{MAX_RETRY}] 기업마당 지연 {RETRY_WAIT}초 대기...")
             time.sleep(RETRY_WAIT)
     else:
-        print("  [경고] 기업마당 서버 연결 실패 — 이번 회차 건너뜁니다.")
+        print("  [경고] 기업마당 연결 실패 — 이번 회차 건너뜁니다.")
         return []
-
     data = resp.json()
     if isinstance(data, dict):
         items = (data.get("jsonArray") or data.get("item")
@@ -201,7 +193,6 @@ def fetch_bizinfo():
         items = data
     else:
         items = []
-
     if not items:
         print("  [경고] 기업마당 응답에 공고 없음. 키:",
               list(data.keys()) if isinstance(data, dict) else type(data))
@@ -210,11 +201,9 @@ def fetch_bizinfo():
 def normalize_bizinfo(item):
     raw_id = pick(item, "pblancId", "seq", "id")
     title  = pick(item, "pblancNm", "title")
-    if not raw_id or not title:
-        return None
+    if not raw_id or not title: return None
     url = pick(item, "pblancUrl", "link", "url")
-    if url.startswith("/"):
-        url = BIZINFO_BASE + url
+    if url.startswith("/"): url = BIZINFO_BASE + url
     org      = pick(item, "jrsdInsttNm", "excInsttNm", "creatorNm")
     reg_date = parse_date(pick(item, "creatPnttm", "regDt", "pubDate"))
     deadline = parse_deadline(pick(item, "reqstBeginEndDe", "reqstDe"))
@@ -231,105 +220,180 @@ def normalize_bizinfo(item):
 
 
 # ==================================================================
-# 2단계: NTIS 국가R&D통합공고 RSS
+# 2단계: NTIS — Ajax→HTML→RSS 3중 폴백
 # ==================================================================
-def fetch_ntis():
-    """NTIS RSS 피드를 파싱해 공고 목록 반환"""
-    last_err = None
-    for attempt in range(1, MAX_RETRY + 1):
+
+# ---- Ajax JSON ----
+def _ntis_ajax(max_pages=5):
+    items = []
+    sess = requests.Session()
+    sess.headers.update({**BROWSER_HEADERS,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    })
+    for page in range(1, max_pages + 1):
         try:
-            resp = requests.get(NTIS_RSS_URL, headers=RSS_HEADERS, timeout=60)
-            resp.raise_for_status()
+            resp = sess.post(NTIS_AJAX_URL, data={
+                "pageIndex": str(page), "recordCountPerPage": "20",
+                "searchGbnCd": "", "searchWord": "",
+            }, timeout=30)
+            if resp.status_code != 200: break
+            data = resp.json()
+            rows = (data.get("resultList") or data.get("list")
+                    or data.get("items") or [])
+            if not rows: break
+            items.extend(rows)
+        except Exception as e:
+            print(f"  [NTIS-Ajax] 페이지 {page} 실패: {e}")
             break
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout) as e:
-            last_err = e
-            print(f"  [재시도 {attempt}/{MAX_RETRY}] NTIS 접속 지연 {RETRY_WAIT}초 대기...")
-            time.sleep(RETRY_WAIT)
-    else:
-        print("  [경고] NTIS 서버 연결 실패 — 이번 회차 건너뜁니다.")
-        return []
-
-    try:
-        root = ET.fromstring(resp.content)
-    except ET.ParseError as e:
-        print(f"  [경고] NTIS RSS XML 파싱 실패: {e}")
-        return []
-
-    # RSS 네임스페이스 처리
-    ns = {"dc": "http://purl.org/dc/elements/1.1/"}
-    items = root.findall(".//item")
-    if not items:
-        print("  [경고] NTIS RSS에 item이 없습니다.")
     return items
 
-def normalize_ntis(item):
-    """RSS <item> -> 통일된 공고 딕셔너리"""
-    def tag(name):
-        el = item.find(name)
+def _norm_ajax(row):
+    raw_id = str(row.get("roRndUid") or row.get("uid") or "")
+    title  = str(row.get("roRndNm") or row.get("title") or "").strip()
+    if not raw_id or not title: return None
+    org      = str(row.get("mngtInsttNm") or "").strip()
+    reg_date = parse_date(row.get("regDt") or "")
+    deadline = parse_date(row.get("rceptEndDt") or "")
+    url      = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
+    return {"id": f"NTIS-{raw_id}", "title": title, "org": org, "url": url,
+            "reg_date": reg_date, "deadline": deadline,
+            "region": detect_region(org, title),
+            "fields": detect_fields(title), "source": "NTIS"}
+
+# ---- HTML 파싱 ----
+def _ntis_html(max_pages=3):
+    items = []
+    sess = requests.Session()
+    sess.headers.update({**BROWSER_HEADERS, "Accept": "text/html,application/xhtml+xml"})
+    for page in range(1, max_pages + 1):
+        try:
+            resp = sess.get(NTIS_LIST_URL, params={"pageIndex": str(page)}, timeout=30)
+            if resp.status_code != 200: break
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = (soup.select("table.board-list tbody tr") or
+                    soup.select("table tbody tr") or
+                    soup.select(".list-item"))
+            if not rows:
+                print(f"  [NTIS-HTML] 행 없음 (페이지 {page}) — 구조 변경 가능성")
+                break
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) < 2: continue
+                items.append({"_row": row, "_cols": cols})
+        except Exception as e:
+            print(f"  [NTIS-HTML] 페이지 {page} 실패: {e}")
+            break
+    return items
+
+def _norm_html(item):
+    row, cols = item["_row"], item["_cols"]
+    a = row.find("a")
+    if not a: return None
+    title = a.get_text(strip=True)
+    href  = a.get("href", "") or str(a.get("onclick", ""))
+    uid_m = re.search(r"roRndUid[=,'\"\s]+(\d+)", href + str(row))
+    raw_id = uid_m.group(1) if uid_m else str(abs(hash(title)))
+    url    = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
+    texts  = [c.get_text(strip=True) for c in cols]
+    dates  = [parse_date(t) for t in texts if re.search(r"\d{4}", t)]
+    orgs   = [t for t in texts if t and not re.search(r"\d{4}", t) and t != title]
+    return {"id": f"NTIS-{raw_id}", "title": title,
+            "org": orgs[0] if orgs else "",
+            "url": url,
+            "reg_date": dates[0] if dates else "",
+            "deadline": dates[-1] if len(dates) > 1 else "",
+            "region": detect_region(title),
+            "fields": detect_fields(title), "source": "NTIS"}
+
+# ---- RSS ----
+def _ntis_rss():
+    for rss_url in NTIS_RSS_URLS:
+        try:
+            resp = requests.get(rss_url, headers={**BROWSER_HEADERS,
+                "Accept": "application/rss+xml,application/xml,text/xml,*/*"},
+                timeout=30)
+            if resp.status_code != 200: continue
+            if "html" in resp.headers.get("Content-Type", ""):
+                print(f"  [NTIS-RSS] {rss_url} -> HTML 응답(로그인 필요), 건너뜁니다.")
+                continue
+            root = ET.fromstring(resp.content)
+            items = root.findall(".//item")
+            if items:
+                print(f"  [NTIS-RSS] {rss_url} -> {len(items)}건 수신")
+                return items
+        except ET.ParseError as e:
+            print(f"  [NTIS-RSS] {rss_url} XML 파싱 오류: {e}")
+        except Exception as e:
+            print(f"  [NTIS-RSS] {rss_url} 실패: {e}")
+    return []
+
+def _norm_rss(item):
+    def tag(n):
+        el = item.find(n)
         return el.text.strip() if el is not None and el.text else ""
+    title = tag("title"); link = tag("link"); guid = tag("guid") or link
+    if not title: return None
+    uid_m  = re.search(r"roRndUid=(\d+)", guid + link)
+    raw_id = uid_m.group(1) if uid_m else str(abs(hash(guid)))
+    url    = link if link.startswith("http") else (
+             f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}")
+    reg_date = parse_date(tag("pubDate"))
+    desc     = tag("description")
+    dl_m     = re.search(r"(?:마감|종료)[^\d]*(\d{4}[.\-]\d{1,2}[.\-]\d{1,2})", desc)
+    deadline = parse_date(dl_m.group(1)) if dl_m else ""
+    return {"id": f"NTIS-{raw_id}", "title": title, "org": tag("author"),
+            "url": url, "reg_date": reg_date, "deadline": deadline,
+            "region": detect_region(title),
+            "fields": detect_fields(title, desc), "source": "NTIS"}
 
-    def dc_tag(name):
-        el = item.find(f"{{http://purl.org/dc/elements/1.1/}}{name}")
-        return el.text.strip() if el is not None and el.text else ""
+# ---- NTIS 진입점 ----
+def fetch_ntis():
+    print("  [NTIS] 방법1: Ajax JSON 시도...")
+    raw = _ntis_ajax()
+    if raw:
+        result = [n for n in (_norm_ajax(r) for r in raw) if n]
+        print(f"  [NTIS] Ajax 성공: {len(raw)}건 수신")
+        return result
 
-    title = tag("title")
-    link  = tag("link")
-    guid  = tag("guid") or link   # 고유 식별자
+    print("  [NTIS] 방법2: HTML 파싱 시도...")
+    raw = _ntis_html()
+    if raw:
+        result = [n for n in (_norm_html(r) for r in raw) if n]
+        print(f"  [NTIS] HTML 성공: {len(raw)}건 수신")
+        return result
 
-    if not title or not guid:
-        return None
+    print("  [NTIS] 방법3: RSS 피드 시도...")
+    raw = _ntis_rss()
+    if raw:
+        return [n for n in (_norm_rss(r) for r in raw) if n]
 
-    # NTIS guid 예: https://www.ntis.go.kr/rndgate/eg/un/ra/view.do?roRndUid=1253946
-    raw_id = re.search(r"roRndUid=(\d+)", guid)
-    notice_id = f"NTIS-{raw_id.group(1)}" if raw_id else f"NTIS-{abs(hash(guid))}"
+    print("  [NTIS] 세 가지 방법 모두 실패 — 건너뜁니다.")
+    return []
 
-    pub_date = tag("pubDate") or dc_tag("date")
-    reg_date = parse_date(pub_date)
 
-    # 마감일: <description>에 포함된 경우가 많음
-    desc = tag("description")
-    deadline_match = re.search(
-        r"(?:마감|접수마감|신청마감|접수종료)[^\d]*(\d{4}[년.\-]\d{1,2}[월.\-]\d{1,2})", desc)
-    deadline = parse_date(deadline_match.group(1)) if deadline_match else ""
-
-    org = dc_tag("creator") or tag("author") or ""
-    category = tag("category") or dc_tag("subject") or ""
-
-    fields = [f for f in FIELD_NAMES if f in title + desc + category] or ["기술"]
-
-    url = link if link.startswith("http") else (NTIS_BASE + link if link else "")
-
-    return {
-        "id": notice_id, "title": title, "org": org,
-        "url": url, "reg_date": reg_date, "deadline": deadline,
-        "region": detect_region(title, org, category),
-        "fields": fields, "source": "NTIS",
-    }
+# ==================================================================
+# 수집 공통 처리
+# ==================================================================
+def collect_source(name, notices, existing):
+    recent = [n for n in notices if is_recent(n)]
+    new    = [n for n in recent  if n["id"] not in existing]
+    print(f"  정규화 {len(notices)}건 → 최근 {DAYS_BACK}일 {len(recent)}건 → 신규 {len(new)}건")
+    saved = 0
+    for n in new:
+        if create_page(n):
+            saved += 1
+            existing.add(n["id"])
+            print(f"    [저장] {n.get('reg_date','')} | {n['title'][:45]}")
+        time.sleep(0.4)
+    print(f"  [{name}] 저장 완료: {saved}건")
+    return saved
 
 
 # ==================================================================
 # 메인
 # ==================================================================
-def collect_source(name, raw_items, normalize_fn, existing):
-    """수집 → 정규화 → 최근 필터 → 중복 제거 → 저장"""
-    notices = [n for n in (normalize_fn(i) for i in raw_items) if n]
-    recent  = [n for n in notices if is_recent(n)]
-    new     = [n for n in recent  if n["id"] not in existing]
-
-    print(f"  수신 {len(raw_items)}건 → 최근 {DAYS_BACK}일 {len(recent)}건 "
-          f"→ 신규 {len(new)}건")
-
-    saved = 0
-    for n in new:
-        if create_page(n):
-            saved += 1
-            existing.add(n["id"])   # 같은 실행 내 중복 방지
-            print(f"    [저장] {n['reg_date']} | {n['title'][:45]}")
-        time.sleep(0.4)
-    print(f"  [{name}] 저장 완료: {saved}건")
-    return saved
-
 def main():
     missing = [k for k, v in {
         "NOTION_API_KEY":     NOTION_API_KEY,
@@ -349,17 +413,15 @@ def main():
 
     total = 0
 
-    # --- 1단계: 기업마당 ---
-    print("[1단계] 기업마당 수집 시작")
-    biz_items = fetch_bizinfo()
-    total += collect_source("기업마당", biz_items, normalize_bizinfo, existing)
+    print("[1단계] 기업마당")
+    raw_biz = fetch_bizinfo()
+    notices_biz = [n for n in (normalize_bizinfo(i) for i in raw_biz) if n]
+    total += collect_source("기업마당", notices_biz, existing)
 
     print()
-
-    # --- 2단계: NTIS ---
-    print("[2단계] NTIS 국가R&D통합공고 수집 시작")
-    ntis_items = fetch_ntis()
-    total += collect_source("NTIS", ntis_items, normalize_ntis, existing)
+    print("[2단계] NTIS 국가R&D통합공고")
+    notices_ntis = fetch_ntis()
+    total += collect_source("NTIS", notices_ntis, existing)
 
     print(f"\n{'='*55}")
     print(f"  전체 신규 저장: {total}건  완료")
