@@ -2,9 +2,8 @@ name: 지원사업 공고 자동 수집
 
 on:
   schedule:
-    # UTC 23:00 = 한국시간 오전 8:00
     - cron: '0 23 * * *'
-  workflow_dispatch:   # GitHub 화면에서 수동 실행 버튼
+  workflow_dispatch:
 
 jobs:
   collect:
