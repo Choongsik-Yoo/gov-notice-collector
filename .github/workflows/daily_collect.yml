@@ -25,5 +25,5 @@ jobs:
         run: python main.py
         env:
           NOTION_API_KEY: ${{ secrets.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 }}
-          NOTION_DATABASE_ID: ${{ secrets.09ad73bb5325838993ab01b32bc76f9e }}
+          NOTION_DATABASE_ID:09ad73bb5325838993ab01b32bc76f9e
           BIZINFO_API_KEY: ${{ secrets.wKJ7t3 }}
