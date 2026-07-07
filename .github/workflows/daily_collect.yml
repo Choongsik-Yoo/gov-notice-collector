@@ -1,29 +1,25 @@
-name: 지원사업 공고 자동 수집
+name: notice-collector
 
 on:
   schedule:
-    - cron: '0 23 * * *'    # 한국시간 오전 8:00
-    - cron: '40 23 * * *'   # 한국시간 오전 8:40
-    - cron: '20 0 * * *'    # 한국시간 오전 9:20
-   workflow_dispatch:
+    - cron: "0 23 * * *"
+    - cron: "40 23 * * *"
+    - cron: "20 0 * * *"
+  workflow_dispatch:
 
 jobs:
   collect:
     runs-on: ubuntu-latest
     steps:
-      - name: 코드 가져오기
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 파이썬 설치
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: 라이브러리 설치
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: 공고 수집 실행
-        run: python main.py
+      - run: python main.py
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: 09ad73bb5325838993ab01b32bc76f9e
