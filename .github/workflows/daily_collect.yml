@@ -23,6 +23,6 @@ jobs:
       - name: 공고 수집 실행
         run: python main.py
         env:
-          NOTION_API_KEY: ${{ secrets.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 }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: 09ad73bb5325838993ab01b32bc76f9e
-          BIZINFO_API_KEY: ${{ secrets.wKJ7t3 }}
+          BIZINFO_API_KEY: ${{ secrets.BIZINFO_API_KEY }}
