@@ -2,8 +2,10 @@ name: 지원사업 공고 자동 수집
 
 on:
   schedule:
-    - cron: '0 23 * * *'
-  workflow_dispatch:
+    - cron: '0 23 * * *'    # 한국시간 오전 8:00
+    - cron: '40 23 * * *'   # 한국시간 오전 8:40
+    - cron: '20 0 * * *'    # 한국시간 오전 9:20
+   workflow_dispatch:
 
 jobs:
   collect:
