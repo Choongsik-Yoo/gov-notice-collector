@@ -294,6 +294,7 @@ def _norm_ajax(row):
 # ---- HTML 파싱 ----
 def _ntis_html(max_pages=3):
     items = []
+    col_idx = {}
     sess = requests.Session()
     sess.headers.update({**BROWSER_HEADERS, "Accept": "text/html,application/xhtml+xml"})
     for page in range(1, max_pages + 1):
@@ -301,16 +302,36 @@ def _ntis_html(max_pages=3):
             resp = sess.get(NTIS_LIST_URL, params={"pageIndex": str(page)}, timeout=30)
             if resp.status_code != 200: break
             soup = BeautifulSoup(resp.text, "html.parser")
+            # 헤더 분석 (최초 1회)
+            if not col_idx:
+                headers = soup.select("table thead th, table th")
+                for i, th in enumerate(headers):
+                    txt = th.get_text(strip=True)
+                    if any(k in txt for k in ["공고명","사업명","과제명","제목"]):
+                        col_idx["title"] = i
+                    elif any(k in txt for k in ["등록일","공고일","게시일"]):
+                        col_idx["reg"] = i
+                    elif any(k in txt for k in ["마감일","종료일","접수마감","신청마감"]):
+                        col_idx["end"] = i
+                    elif any(k in txt for k in ["기관","부처","주관"]):
+                        col_idx["org"] = i
+                if col_idx:
+                    print(f"  [NTIS-HTML] 컬럼 매핑: {col_idx}")
+                else:
+                    print(f"  [NTIS-HTML] 헤더 자동 감지 실패 — 위치 기반 파싱 시도")
+                    # 진단: 헤더 텍스트 출력
+                    print(f"  [NTIS-HTML] 감지된 헤더: {[th.get_text(strip=True) for th in headers]}")
             rows = (soup.select("table.board-list tbody tr") or
                     soup.select("table tbody tr") or
                     soup.select(".list-item"))
             if not rows:
-                print(f"  [NTIS-HTML] 행 없음 (페이지 {page}) — 구조 변경 가능성")
+                print(f"  [NTIS-HTML] 행 없음 (페이지 {page})")
+                print(f"  [NTIS-HTML] HTML 앞 800자: {resp.text[:800]}")
                 break
             for row in rows:
                 cols = row.find_all("td")
                 if len(cols) < 2: continue
-                items.append({"_row": row, "_cols": cols})
+                items.append({"_row": row, "_cols": cols, "_col_idx": dict(col_idx)})
         except Exception as e:
             print(f"  [NTIS-HTML] 페이지 {page} 실패: {e}")
             break
@@ -318,24 +339,62 @@ def _ntis_html(max_pages=3):
 
 def _norm_html(item):
     row, cols = item["_row"], item["_cols"]
-    a = row.find("a")
-    if not a: return None
-    title = a.get_text(strip=True)
-    href  = a.get("href", "") or str(a.get("onclick", ""))
-    uid_m = re.search(r"roRndUid[=,'\"\s]+(\d+)", href + str(row))
-    raw_id = uid_m.group(1) if uid_m else str(abs(hash(title)))
-    url    = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
-    texts  = [c.get_text(strip=True) for c in cols]
-    dates  = [parse_date(t) for t in texts if re.search(r"\d{4}", t)]
-    orgs   = [t for t in texts if t and not re.search(r"\d{4}", t) and t != title]
-    return {"id": f"NTIS-{raw_id}", "title": title,
-            "org": orgs[0] if orgs else "",
-            "url": url,
-            "reg_date": dates[0] if dates else "",
-            "deadline": dates[-1] if len(dates) > 1 else "",
-            "region": detect_region(title),
-            "fields": detect_fields(title), "source": "NTIS"}
+    col_idx = item.get("_col_idx", {})
+    texts = [c.get_text(strip=True) for c in cols]
 
+    # 제목 추출: 헤더 인덱스 → 링크 태그 순
+    title = ""
+    raw_id = ""
+    if "title" in col_idx and col_idx["title"] < len(cols):
+        a = cols[col_idx["title"]].find("a")
+        if a:
+            title = a.get_text(strip=True)
+            href = a.get("href", "") + str(a.get("onclick", ""))
+            m = re.search(r"roRndUid[=,]+(\d+)", href + str(row))
+            if m: raw_id = m.group(1)
+    if not title:
+        for td in cols:
+            a = td.find("a")
+            if a and len(a.get_text(strip=True)) > 5:
+                title = a.get_text(strip=True)
+                href = a.get("href", "") + str(a.get("onclick", ""))
+                m = re.search(r"roRndUid[=,]+(\d+)", href + str(row))
+                if m: raw_id = m.group(1)
+                break
+    if not title: return None
+    if not raw_id:
+        m = re.search(r"roRndUid[=,]+(\d+)", str(row))
+        raw_id = m.group(1) if m else str(abs(hash(title)))
+    url = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
+
+    # 기관명
+    org = ""
+    if "org" in col_idx and col_idx["org"] < len(texts):
+        org = texts[col_idx["org"]]
+    if not org:
+        candidates = [t for t in texts
+                      if t and t != title
+                      and not re.search(r"\d{4}", t)
+                      and len(t) < 30]
+        if candidates: org = candidates[0]
+
+    # 날짜: 헤더 인덱스 → 텍스트 전체 스캔
+    all_dates = [parse_date(t) for t in texts if parse_date(t)]
+    reg_date = ""
+    deadline = ""
+    if "reg" in col_idx and col_idx["reg"] < len(texts):
+        reg_date = parse_date(texts[col_idx["reg"]])
+    if "end" in col_idx and col_idx["end"] < len(texts):
+        deadline = parse_date(texts[col_idx["end"]])
+    if not reg_date and all_dates:
+        reg_date = all_dates[0]
+    if not deadline and len(all_dates) > 1:
+        deadline = all_dates[-1]
+
+    return {"id": f"NTIS-{raw_id}", "title": title, "org": org, "url": url,
+            "reg_date": reg_date, "deadline": deadline,
+            "region": detect_region(org, title),
+            "fields": detect_fields(title), "source": "NTIS"}
 # ---- RSS ----
 def _ntis_rss():
     for rss_url in NTIS_RSS_URLS:
