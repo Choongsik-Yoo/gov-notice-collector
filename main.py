@@ -472,6 +472,214 @@ def fetch_ntis():
     return []
 
 
+
+# ==================================================================
+# 3단계: SMTECH (중소기업기술정보진흥원)
+# ==================================================================
+SMTECH_BASE     = "https://www.smtech.go.kr"
+SMTECH_LIST_URL = "https://www.smtech.go.kr/front/ifg/no/notice1List.do"
+SMTECH_AJAX_URL = "https://www.smtech.go.kr/front/ifg/no/notice1ListAjax.do"
+
+def fetch_smtech():
+    """SMTECH 사업공고 목록 Ajax or HTML 파싱"""
+    sess = requests.Session()
+    sess.headers.update({**BROWSER_HEADERS,
+        "Referer": SMTECH_LIST_URL,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    })
+    items = []
+    # 방법1: Ajax JSON
+    try:
+        for page in range(1, 6):
+            resp = sess.post(SMTECH_AJAX_URL, data={
+                "pageIndex": str(page), "pageUnit": "20",
+                "searchCondition": "", "searchKeyword": "",
+                "bCd": "", "sFld": "", "sStr": "",
+            }, timeout=30)
+            if resp.status_code != 200: break
+            data = resp.json()
+            rows = (data.get("resultList") or data.get("list")
+                    or data.get("items") or data.get("data") or [])
+            if not rows: break
+            if page == 1:
+                print(f"  [SMTECH-Ajax] 첫 공고 키: {list(rows[0].keys())}")
+            items.extend(rows)
+        if items:
+            print(f"  [SMTECH] Ajax 성공: {len(items)}건")
+            return ("ajax", items)
+    except Exception as e:
+        print(f"  [SMTECH-Ajax] 실패: {e}")
+
+    # 방법2: HTML 파싱
+    print("  [SMTECH] HTML 파싱 시도...")
+    sess.headers.update({"Accept": "text/html,application/xhtml+xml"})
+    html_items = []
+    try:
+        for page in range(1, 6):
+            resp = sess.get(SMTECH_LIST_URL,
+                params={"pageIndex": str(page)}, timeout=30)
+            if resp.status_code != 200: break
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = (soup.select("table.board_list tbody tr") or
+                    soup.select("table.tbl_list tbody tr") or
+                    soup.select("table tbody tr"))
+            if not rows: break
+            valid = [r for r in rows if r.find("a") and len(r.find_all("td")) >= 2]
+            if not valid: break
+            html_items.extend(valid)
+        if html_items:
+            print(f"  [SMTECH] HTML 성공: {len(html_items)}건")
+            return ("html", html_items)
+    except Exception as e:
+        print(f"  [SMTECH-HTML] 실패: {e}")
+
+    print("  [SMTECH] 수집 실패 — 건너뜁니다.")
+    return ("none", [])
+
+def normalize_smtech(mode, item):
+    if mode == "ajax":
+        raw_id = str(item.get("bIdx") or item.get("noticeId") or item.get("seq") or item.get("id") or "")
+        title  = str(item.get("title") or item.get("noticeName") or item.get("subject") or "").strip()
+        if not raw_id or not title: return None
+        org      = str(item.get("instNm") or item.get("org") or "중소기업기술정보진흥원").strip()
+        reg_date = parse_date(item.get("registDate") or item.get("regDt") or item.get("crtDt") or "")
+        if not reg_date:
+            for k, v in item.items():
+                if any(x in k.lower() for x in ["reg","regist","crt","date","dt"]):
+                    reg_date = parse_date(str(v))
+                    if reg_date: break
+        deadline = parse_date(item.get("endDate") or item.get("applyEndDt") or item.get("rceptEndDt") or "")
+        if not deadline:
+            for k, v in item.items():
+                if any(x in k.lower() for x in ["end","close","rcpt","rcep"]):
+                    deadline = parse_date(str(v))
+                    if deadline: break
+        # URL 구성
+        url_key = item.get("bIdx") or raw_id
+        url = f"{SMTECH_BASE}/front/ifg/no/notice1View.do?bIdx={url_key}"
+        return {"id": f"SMT-{raw_id}", "title": title, "org": org,
+                "url": url, "reg_date": reg_date, "deadline": deadline,
+                "region": detect_region(org, title),
+                "fields": detect_fields(title), "source": "SMTECH"}
+    else:  # html
+        row = item
+        cols = row.find_all("td")
+        a = None
+        for td in cols:
+            candidate = td.find("a")
+            if candidate and len(candidate.get_text(strip=True)) > 5:
+                a = candidate
+                break
+        if not a: return None
+        title = a.get_text(strip=True)
+        href  = a.get("href", "") or str(a.get("onclick", ""))
+        # bIdx 추출
+        bid_m = re.search(r"bIdx[=,]+(\d+)", href + str(row))
+        raw_id = bid_m.group(1) if bid_m else str(abs(hash(title)))
+        url = f"{SMTECH_BASE}/front/ifg/no/notice1View.do?bIdx={raw_id}"
+        texts = [c.get_text(strip=True) for c in cols]
+        STATUS = {"접수중","마감","접수예정","접수마감","종료","전체"}
+        all_dates = [parse_date(t) for t in texts if parse_date(t)]
+        org_cands = [t for t in texts if t and t != title and t not in STATUS
+                     and not re.search(r"\d{4}", t) and 2 < len(t) < 30]
+        return {"id": f"SMT-{raw_id}", "title": title,
+                "org": org_cands[0] if org_cands else "중소기업기술정보진흥원",
+                "url": url,
+                "reg_date": all_dates[0] if all_dates else "",
+                "deadline": all_dates[-1] if len(all_dates) > 1 else "",
+                "region": detect_region(title),
+                "fields": detect_fields(title), "source": "SMTECH"}
+
+def collect_smtech():
+    mode, raw = fetch_smtech()
+    if mode == "none": return []
+    return [n for n in (normalize_smtech(mode, r) for r in raw) if n]
+
+
+# ==================================================================
+# 3단계: 소진공 (소상공인시장진흥공단)
+# ==================================================================
+SEMAS_BASE     = "https://www.semas.or.kr"
+SEMAS_LIST_URL = "https://www.semas.or.kr/web/board/webBoardList.kmdc"
+SEMAS_BOARD_CD = "240"   # 사업공고 게시판 코드
+
+def fetch_semas():
+    """소진공 사업공고 목록 HTML 파싱"""
+    sess = requests.Session()
+    sess.headers.update({**BROWSER_HEADERS,
+        "Referer": SEMAS_BASE,
+        "Accept": "text/html,application/xhtml+xml",
+    })
+    items = []
+    try:
+        for page in range(1, 6):
+            resp = sess.get(SEMAS_LIST_URL, params={
+                "bCd": SEMAS_BOARD_CD,
+                "pNm": "BOA0103",
+                "page": str(page),
+            }, timeout=30)
+            if resp.status_code != 200: break
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = (soup.select("table.board_list tbody tr") or
+                    soup.select("table.tbl_list tbody tr") or
+                    soup.select("table tbody tr") or
+                    soup.select(".board-list tr"))
+            valid = [r for r in rows
+                     if r.find("a") and len(r.find_all("td")) >= 2]
+            if not valid:
+                print(f"  [소진공-HTML] 페이지 {page}: 행 없음")
+                # 진단
+                if page == 1:
+                    print(f"  [소진공] HTML 앞 800자: {resp.text[:800]}")
+                break
+            items.extend(valid)
+        if items:
+            print(f"  [소진공] HTML 성공: {len(items)}건")
+    except Exception as e:
+        print(f"  [소진공] 실패: {e}")
+    return items
+
+def normalize_semas(row):
+    cols = row.find_all("td")
+    a = None
+    for td in cols:
+        candidate = td.find("a")
+        if candidate and len(candidate.get_text(strip=True)) > 5:
+            a = candidate
+            break
+    if not a: return None
+    title = a.get_text(strip=True)
+    href  = a.get("href", "") or str(a.get("onclick", ""))
+    # b_idx 추출
+    bid_m = re.search(r"b_idx[=,]+(\d+)", href + str(row))
+    raw_id = bid_m.group(1) if bid_m else str(abs(hash(title)))
+    # 절대 URL
+    if href.startswith("http"):
+        url = href
+    elif href.startswith("/"):
+        url = SEMAS_BASE + href
+    else:
+        url = f"{SEMAS_BASE}/web/board/webBoardView.kmdc?bCd={SEMAS_BOARD_CD}&b_idx={raw_id}&pNm=BOA0103"
+
+    texts = [c.get_text(strip=True) for c in cols]
+    STATUS = {"접수중","마감","접수예정","접수마감","종료","전체","공지"}
+    all_dates = [parse_date(t) for t in texts if parse_date(t)]
+    org_cands = [t for t in texts if t and t != title and t not in STATUS
+                 and not re.search(r"\d{4}", t) and 2 < len(t) < 30]
+    return {"id": f"SEMAS-{raw_id}", "title": title,
+            "org": org_cands[0] if org_cands else "소상공인시장진흥공단",
+            "url": url,
+            "reg_date": all_dates[0] if all_dates else "",
+            "deadline": all_dates[-1] if len(all_dates) > 1 else "",
+            "region": detect_region(title),
+            "fields": detect_fields(title), "source": "소진공"}
+
+def collect_semas():
+    raw = fetch_semas()
+    return [n for n in (normalize_semas(r) for r in raw) if n]
+
 # ==================================================================
 # 수집 공통 처리
 # ==================================================================
@@ -521,6 +729,16 @@ def main():
     print("[2단계] NTIS 국가R&D통합공고")
     notices_ntis = fetch_ntis()
     total += collect_source("NTIS", notices_ntis, existing)
+
+    print()
+    print("[3단계] SMTECH 중소기업기술정보진흥원")
+    notices_smt = collect_smtech()
+    total += collect_source("SMTECH", notices_smt, existing)
+
+    print()
+    print("[3단계] 소진공 소상공인시장진흥공단")
+    notices_semas = collect_semas()
+    total += collect_source("소진공", notices_semas, existing)
 
     print(f"\n{'='*55}")
     print(f"  전체 신규 저장: {total}건  완료")
