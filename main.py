@@ -477,7 +477,8 @@ def fetch_ntis():
 # 3단계: SMTECH (중소기업기술정보진흥원)
 # ==================================================================
 SMTECH_BASE     = "https://www.smtech.go.kr"
-SMTECH_LIST_URL = "https://www.smtech.go.kr/front/ifg/no/notice1List.do"
+SMTECH_RMS_URL  = "https://www.smtech.go.kr/region/rms"   # 실제 공고 목록
+SMTECH_LIST_URL = "https://www.smtech.go.kr/front/ifg/no/notice1List.do"   # 구버전(폴백)
 SMTECH_AJAX_URL = "https://www.smtech.go.kr/front/ifg/no/notice1ListAjax.do"
 
 def _make_ssl_session(base_url):
@@ -501,110 +502,89 @@ def _make_ssl_session(base_url):
     return sess
 
 def fetch_smtech():
-    """SMTECH 사업공고 목록 Ajax or HTML 파싱 (SSL 우회 + 재시도)"""
-    items = []
-    # 방법1: Ajax JSON
+    """SMTECH 공고 수집: RMS 페이지 파싱 (제목+접수기간이 HTML에 직접 노출)"""
+    result = []
+    sess = _make_ssl_session(SMTECH_RMS_URL)
+    sess.headers.update({"Accept": "text/html,application/xhtml+xml"})
     try:
-        sess = _make_ssl_session(SMTECH_LIST_URL)
-        sess.headers.update({
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        })
-        for page in range(1, 6):
-            for attempt in range(1, MAX_RETRY + 1):
-                try:
-                    resp = sess.post(SMTECH_AJAX_URL, data={
-                        "pageIndex": str(page), "pageUnit": "20",
-                        "searchCondition": "", "searchKeyword": "",
-                    }, timeout=40)
-                    break
-                except (requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout) as e:
-                    if attempt == MAX_RETRY: raise
-                    print(f"  [SMTECH-Ajax] 재시도 {attempt}/{MAX_RETRY}...")
-                    time.sleep(10)
-            if resp.status_code != 200: break
-            data = resp.json()
-            rows = (data.get("resultList") or data.get("list")
-                    or data.get("items") or data.get("data") or [])
-            if not rows: break
-            if page == 1:
-                print(f"  [SMTECH-Ajax] 첫 공고 키: {list(rows[0].keys())}")
-            items.extend(rows)
-        if items:
-            print(f"  [SMTECH] Ajax 성공: {len(items)}건")
-            return ("ajax", items)
-    except Exception as e:
-        print(f"  [SMTECH-Ajax] 실패: {type(e).__name__}: {e}")
-
-    # 방법2: HTML (여러 URL 후보)
-    print("  [SMTECH] HTML 파싱 시도...")
-    list_urls = [
-        SMTECH_LIST_URL,
-        "https://www.smtech.go.kr/front/ifg/no/notice1List.do",
-        "https://smtech.go.kr/front/comn/main/main.do",
-    ]
-    html_items = []
-    for list_url in list_urls:
-        try:
-            sess2 = _make_ssl_session(list_url)
-            sess2.headers.update({"Accept": "text/html,application/xhtml+xml"})
-            resp = sess2.get(list_url, params={"pageIndex": "1"}, timeout=40)
-            if resp.status_code != 200:
-                print(f"  [SMTECH-HTML] {list_url} -> {resp.status_code}")
-                continue
+        resp = sess.get(SMTECH_RMS_URL, timeout=40)
+        if resp.status_code != 200:
+            print(f"  [SMTECH-RMS] HTTP {resp.status_code}")
+        else:
+            from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
-            rows = (soup.select("table.board_list tbody tr") or
-                    soup.select("table.tbl_list tbody tr") or
-                    soup.select("table tbody tr"))
-            valid = [r for r in rows if r.find("a") and len(r.find_all("td")) >= 2]
-            if valid:
-                # 성공 시 나머지 페이지도 수집
-                html_items.extend(valid)
-                for page in range(2, 6):
-                    resp2 = sess2.get(list_url, params={"pageIndex": str(page)}, timeout=40)
-                    if resp2.status_code != 200: break
-                    soup2 = BeautifulSoup(resp2.text, "html.parser")
-                    rows2 = (soup2.select("table.board_list tbody tr") or
-                             soup2.select("table.tbl_list tbody tr") or
-                             soup2.select("table tbody tr"))
-                    valid2 = [r for r in rows2 if r.find("a") and len(r.find_all("td")) >= 2]
-                    if not valid2: break
-                    html_items.extend(valid2)
-                print(f"  [SMTECH] HTML 성공({list_url}): {len(html_items)}건")
-                return ("html", html_items)
-        except Exception as e:
-            print(f"  [SMTECH-HTML] {list_url} 실패: {type(e).__name__}: {str(e)[:100]}")
+            # 공고 항목: li 또는 div 안에 제목+접수기간 구조
+            # 구조: <li> 상태(마감임박/접수중 등) + 마감일 + 제목 + 접수기간 </li>
+            items_raw = (soup.select("ul li") or soup.select(".list-wrap li")
+                        or soup.select("section li"))
+            for li in items_raw:
+                text = li.get_text(" ", strip=True)
+                # 제목이 있는 항목만 (접수기간 패턴이 있는 것)
+                if "접수기간" in text and len(text) > 20:
+                    result.append(li)
+            if result:
+                print(f"  [SMTECH-RMS] 성공: {len(result)}건")
+                return ("rms", result)
+            else:
+                print(f"  [SMTECH-RMS] 항목 없음. HTML 앞 800자:")
+                print(f"  {resp.text[:800]}")
+    except Exception as e:
+        print(f"  [SMTECH-RMS] 실패: {type(e).__name__}: {str(e)[:100]}")
 
     print("  [SMTECH] 수집 실패 — 건너뜁니다.")
     return ("none", [])
 
+
 def normalize_smtech(mode, item):
-    if mode == "ajax":
-        raw_id = str(item.get("bIdx") or item.get("noticeId") or item.get("seq") or item.get("id") or "")
-        title  = str(item.get("title") or item.get("noticeName") or item.get("subject") or "").strip()
+    if mode == "rms":
+        li = item
+        text = li.get_text(" ", strip=True)
+        # 접수기간: "접수기간 : 2026-06-25 ~ 2026-07-08" 패턴 추출
+        period_m = re.search(
+            r"접수기간\s*[:：]\s*(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})", text)
+        start_date = period_m.group(1) if period_m else ""
+        end_date   = period_m.group(2) if period_m else ""
+        # 제목: 상태값·날짜·접수기간 라벨·신청버튼 제거 후 나머지
+        STATUS_PAT = r"(마감임박|접수중|접수완료|접수예정|상세보기|신청하기|접수기간.*$)"
+        DATE_PAT   = r"\d{4}-\d{2}-\d{2}"
+        clean = re.sub(STATUS_PAT, "", text, flags=re.MULTILINE)
+        clean = re.sub(DATE_PAT, "", clean)
+        clean = re.sub(r"마감일\s*:", "", clean)
+        clean = re.sub(r"\s{2,}", " ", clean).strip()
+        title = clean.strip() if len(clean.strip()) > 5 else ""
+        if not title: return None
+        # 고유ID: 제목 해시 (RMS는 URL에 ID 없음)
+        raw_id = str(abs(hash(title + start_date)))[:12]
+        return {"id": f"SMT-{raw_id}", "title": title[:200],
+                "org": "중소기업기술정보진흥원",
+                "url": SMTECH_RMS_URL,
+                "reg_date": start_date, "deadline": end_date,
+                "region": detect_region(title),
+                "fields": detect_fields(title), "source": "SMTECH"}
+
+    elif mode == "ajax":
+        raw_id = str(item.get("bIdx") or item.get("noticeId") or item.get("seq") or "")
+        title  = str(item.get("title") or item.get("noticeName") or "").strip()
         if not raw_id or not title: return None
-        org      = str(item.get("instNm") or item.get("org") or "중소기업기술정보진흥원").strip()
-        reg_date = parse_date(item.get("registDate") or item.get("regDt") or item.get("crtDt") or "")
+        org      = str(item.get("instNm") or "중소기업기술정보진흥원").strip()
+        reg_date = parse_date(item.get("registDate") or item.get("regDt") or "")
         if not reg_date:
             for k, v in item.items():
-                if any(x in k.lower() for x in ["reg","regist","crt","date","dt"]):
+                if any(x in k.lower() for x in ["reg","date","dt","crt"]):
                     reg_date = parse_date(str(v))
                     if reg_date: break
-        deadline = parse_date(item.get("endDate") or item.get("applyEndDt") or item.get("rceptEndDt") or "")
+        deadline = parse_date(item.get("endDate") or item.get("applyEndDt") or "")
         if not deadline:
             for k, v in item.items():
-                if any(x in k.lower() for x in ["end","close","rcpt","rcep"]):
+                if any(x in k.lower() for x in ["end","close","rcpt"]):
                     deadline = parse_date(str(v))
                     if deadline: break
-        # URL 구성
-        url_key = item.get("bIdx") or raw_id
-        url = f"{SMTECH_BASE}/front/ifg/no/notice1View.do?bIdx={url_key}"
+        url = f"{SMTECH_BASE}/front/ifg/no/notice1View.do?bIdx={raw_id}"
         return {"id": f"SMT-{raw_id}", "title": title, "org": org,
                 "url": url, "reg_date": reg_date, "deadline": deadline,
                 "region": detect_region(org, title),
                 "fields": detect_fields(title), "source": "SMTECH"}
+
     else:  # html
         row = item
         cols = row.find_all("td")
@@ -612,17 +592,15 @@ def normalize_smtech(mode, item):
         for td in cols:
             candidate = td.find("a")
             if candidate and len(candidate.get_text(strip=True)) > 5:
-                a = candidate
-                break
+                a = candidate; break
         if not a: return None
         title = a.get_text(strip=True)
         href  = a.get("href", "") or str(a.get("onclick", ""))
-        # bIdx 추출
         bid_m = re.search(r"bIdx[=,]+(\d+)", href + str(row))
         raw_id = bid_m.group(1) if bid_m else str(abs(hash(title)))
         url = f"{SMTECH_BASE}/front/ifg/no/notice1View.do?bIdx={raw_id}"
         texts = [c.get_text(strip=True) for c in cols]
-        STATUS = {"접수중","마감","접수예정","접수마감","종료","전체"}
+        STATUS = {"접수중","마감","접수예정","종료","전체"}
         all_dates = [parse_date(t) for t in texts if parse_date(t)]
         org_cands = [t for t in texts if t and t != title and t not in STATUS
                      and not re.search(r"\d{4}", t) and 2 < len(t) < 30]
