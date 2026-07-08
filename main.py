@@ -232,6 +232,7 @@ def _ntis_ajax(max_pages=5):
         "X-Requested-With": "XMLHttpRequest",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     })
+    first_logged = False
     for page in range(1, max_pages + 1):
         try:
             resp = sess.post(NTIS_AJAX_URL, data={
@@ -243,6 +244,11 @@ def _ntis_ajax(max_pages=5):
             rows = (data.get("resultList") or data.get("list")
                     or data.get("items") or [])
             if not rows: break
+            if not first_logged and rows:
+                print("  [NTIS 필드 진단] 첫 공고 전체 키:")
+                for k, v in rows[0].items():
+                    print(f"    {k}: {repr(v)}")
+                first_logged = True
             items.extend(rows)
         except Exception as e:
             print(f"  [NTIS-Ajax] 페이지 {page} 실패: {e}")
@@ -253,10 +259,33 @@ def _norm_ajax(row):
     raw_id = str(row.get("roRndUid") or row.get("uid") or "")
     title  = str(row.get("roRndNm") or row.get("title") or "").strip()
     if not raw_id or not title: return None
-    org      = str(row.get("mngtInsttNm") or "").strip()
-    reg_date = parse_date(row.get("regDt") or "")
-    deadline = parse_date(row.get("rceptEndDt") or "")
-    url      = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
+    org = str(row.get("mngtInsttNm") or row.get("jrsdInsttNm") or "").strip()
+
+    # 등록일 후보 키 전부 시도
+    reg_date = parse_date(
+        row.get("regDt") or row.get("registDt") or row.get("crtDt") or
+        row.get("pblancDt") or row.get("roRegistDt") or row.get("inptDt") or ""
+    )
+    # 자동 탐색: 아직 못 찾았으면 키명에 reg/crt 포함된 것 순회
+    if not reg_date:
+        for k, v in row.items():
+            if any(x in k.lower() for x in ["reg", "regist", "crt", "inpt", "pblanc"]):
+                reg_date = parse_date(str(v))
+                if reg_date: break
+
+    # 마감일 후보 키 전부 시도
+    deadline = parse_date(
+        row.get("rceptEndDt") or row.get("rcptEndDt") or row.get("endDt") or
+        row.get("applyEndDt") or row.get("roRceptEndDt") or
+        row.get("reqstEndDe") or row.get("closeDate") or ""
+    )
+    if not deadline:
+        for k, v in row.items():
+            if any(x in k.lower() for x in ["end", "close", "rcpt", "rcep"]):
+                deadline = parse_date(str(v))
+                if deadline: break
+
+    url = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
     return {"id": f"NTIS-{raw_id}", "title": title, "org": org, "url": url,
             "reg_date": reg_date, "deadline": deadline,
             "region": detect_region(org, title),
