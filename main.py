@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 NOTION_API_KEY     = os.environ.get("NOTION_API_KEY", "").strip()
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "").strip()
 BIZINFO_API_KEY    = os.environ.get("BIZINFO_API_KEY", "").strip()
+DATA_GO_KR_KEY     = os.environ.get("DATA_GO_KR_KEY", "").strip()   # 공공데이터포털 인증키
 
 DAYS_BACK   = int(os.environ.get("DAYS_BACK",   "3"))
 FETCH_COUNT = int(os.environ.get("FETCH_COUNT", "300"))
@@ -731,173 +732,111 @@ SMES_AJAX_URLS = [
 ]
 
 def fetch_smes():
-    """소상공인24(중소벤처24) 사업공고 수집"""
-    sess = _make_ssl_session(SMES_BASE)
+    """중소벤처기업부 사업공고 - 공공데이터포털 REST API (XML)"""
+    if not DATA_GO_KR_KEY:
+        print("  [소상공인24] DATA_GO_KR_KEY 없음 — 건너뜁니다.")
+        return []
 
-    # 방법1: 내부 Ajax JSON API
-    sess.headers.update({
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": SMES_LIST_URL,
-    })
-    items = []
-    for ajax_url in SMES_AJAX_URLS:
-        try:
-            resp = sess.post(ajax_url, data={
-                "curPage": "1", "cntPerPage": "20",
-                "progress": "ok", "srchGubun": "",
-                "srchText": "", "srchBeginDt": "", "srchEndDt": "",
-            }, timeout=30)
-            if resp.status_code != 200: continue
-            data = resp.json()
-            rows = (data.get("list") or data.get("resultList")
-                    or data.get("items") or data.get("data") or [])
-            if rows:
-                print(f"  [소상공인24-Ajax] {ajax_url} 성공: {len(rows)}건")
-                print(f"  [소상공인24-Ajax] 첫 공고 키: {list(rows[0].keys())}")
-                # 나머지 페이지 수집
-                for page in range(2, 6):
-                    r2 = sess.post(ajax_url, data={
-                        "curPage": str(page), "cntPerPage": "20",
-                        "progress": "ok", "srchGubun": "", "srchText": "",
-                    }, timeout=30)
-                    if r2.status_code != 200: break
-                    rows2 = (r2.json().get("list") or r2.json().get("resultList")
-                             or r2.json().get("items") or [])
-                    if not rows2: break
-                    rows.extend(rows2)
-                items = rows
-                return ("ajax", items)
-        except Exception as e:
-            print(f"  [소상공인24-Ajax] {ajax_url}: {type(e).__name__}")
-
-    # 방법2: HTML 파싱 (목록 페이지)
-    print("  [소상공인24] HTML 파싱 시도...")
-    sess.headers.update({"Accept": "text/html,application/xhtml+xml"})
-    html_items = []
-    list_urls = [
-        SMES_LIST_URL + "?cntPerPage=20&progress=ok",
-        "https://www.smes.go.kr/main/giup?curPage=1",
-        SMES_LIST_URL,
+    # 공공데이터포털 표준 엔드포인트 후보
+    endpoints = [
+        "https://apis.data.go.kr/1421000/mssBizService/getbizList",
+        "https://apis.data.go.kr/1421000/mssBizService/getBizList",
+        "http://apis.data.go.kr/1421000/mssBizService/getbizList",
     ]
-    for list_url in list_urls:
+    items = []
+    for base in endpoints:
         try:
-            for page in range(1, 6):
-                url = list_url if page == 1 else f"{SMES_LIST_URL}?cntPerPage=20&curPage={page}&progress=ok"
-                resp = sess.get(url, timeout=40)
-                if resp.status_code != 200:
-                    print(f"  [소상공인24-HTML] {url} -> {resp.status_code}")
-                    break
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # 공고 카드 또는 테이블 행 탐색
-                rows = (soup.select(".bsns-list li") or
-                        soup.select(".card-list li") or
-                        soup.select("ul.list li") or
-                        soup.select("table tbody tr") or
-                        soup.select(".board-list tr"))
-                valid = [r for r in rows
-                         if r.find("a") and "viewPblancSeq" in str(r)
-                         and len(r.get_text(strip=True)) > 10]
-                if not valid:
-                    # pblancSeq 패턴으로 재탐색
-                    all_a = soup.find_all("a", href=lambda h: h and "viewPblancSeq" in h)
-                    if all_a:
-                        valid = list({a.find_parent(["li","tr","div"]) for a in all_a
-                                     if a.find_parent(["li","tr","div"])})
-                if not valid:
-                    if page == 1:
-                        print(f"  [소상공인24-HTML] 행 없음. HTML 앞 600자:")
-                        print(f"  {resp.text[:600]}")
-                    break
-                html_items.extend(valid)
-            if html_items:
-                print(f"  [소상공인24] HTML 성공 ({list_url}): {len(html_items)}건")
-                return ("html", html_items)
+            resp = requests.get(base, params={
+                "serviceKey": DATA_GO_KR_KEY,
+                "pageNo": "1",
+                "numOfRows": "100",
+                "type": "json",
+            }, headers=BROWSER_HEADERS, timeout=40)
+            if resp.status_code != 200:
+                print(f"  [소상공인24] {base} -> HTTP {resp.status_code}")
+                continue
+            ctype = resp.headers.get("Content-Type", "")
+            # JSON 우선 시도
+            if "json" in ctype or resp.text.strip().startswith("{"):
+                try:
+                    data = resp.json()
+                    body = data.get("response", {}).get("body", {})
+                    rows = body.get("items", {})
+                    if isinstance(rows, dict):
+                        rows = rows.get("item", [])
+                    if isinstance(rows, dict):
+                        rows = [rows]
+                    if rows:
+                        print(f"  [소상공인24] JSON 성공: {len(rows)}건")
+                        print(f"  [소상공인24] 첫 공고 키: {list(rows[0].keys())}")
+                        return rows
+                except Exception:
+                    pass
+            # XML 파싱
+            try:
+                root = ET.fromstring(resp.content)
+                # 에러 메시지 확인
+                err = root.find(".//errMsg")
+                auth = root.find(".//returnAuthMsg")
+                if err is not None or auth is not None:
+                    msg = (err.text if err is not None else "") + " " + (auth.text if auth is not None else "")
+                    print(f"  [소상공인24] API 오류: {msg.strip()}")
+                    if "SERVICE_KEY" in msg or "인증" in msg:
+                        print("  [소상공인24] 인증키 문제 — 승인/키값 확인 필요")
+                    continue
+                xml_items = root.findall(".//item")
+                if xml_items:
+                    print(f"  [소상공인24] XML 성공: {len(xml_items)}건")
+                    return xml_items
+            except ET.ParseError:
+                print(f"  [소상공인24] {base} 응답이 XML/JSON 아님. 앞 300자: {resp.text[:300]}")
         except Exception as e:
-            print(f"  [소상공인24-HTML] {list_url} 실패: {type(e).__name__}: {str(e)[:100]}")
+            print(f"  [소상공인24] {base} 실패: {type(e).__name__}: {str(e)[:100]}")
 
-    print("  [소상공인24] 수집 실패 — 건너뜁니다.")
-    return ("none", [])
+    print("  [소상공인24] 모든 엔드포인트 실패 — 건너뜁니다.")
+    return []
 
-def normalize_smes(mode, item):
-    if mode == "ajax":
-        # JSON 응답 필드명 다중 후보
-        raw_id = str(item.get("pblancSeq") or item.get("viewPblancSeq")
-                     or item.get("seq") or item.get("id") or "")
-        title  = str(item.get("pblancNm") or item.get("title")
-                     or item.get("subject") or "").strip()
-        if not raw_id or not title: return None
-        org = str(item.get("cntcInsttNm") or item.get("instNm")
-                  or item.get("org") or "중소벤처24").strip()
-        # 등록일
-        reg_date = parse_date(
-            item.get("pblancDt") or item.get("regDt") or
-            item.get("registDt") or item.get("crtDt") or "")
-        if not reg_date:
-            for k, v in item.items():
-                if any(x in k.lower() for x in ["dt","date","regist","pblanc"]):
-                    reg_date = parse_date(str(v))
-                    if reg_date: break
-        # 마감일
-        deadline = parse_date(
-            item.get("rcptEndDt") or item.get("endDt") or
-            item.get("applyEndDt") or item.get("closeDate") or "")
-        if not deadline:
-            for k, v in item.items():
-                if any(x in k.lower() for x in ["end","close","rcpt"]):
-                    deadline = parse_date(str(v))
-                    if deadline: break
-        url = f"{SMES_BASE}/main/sportsBsnsPolicy/view?viewPblancSeq={raw_id}"
-        return {"id": f"SMES-{raw_id}", "title": title, "org": org,
-                "url": url, "reg_date": reg_date, "deadline": deadline,
-                "region": detect_region(org, title),
-                "fields": detect_fields(title), "source": "소상공인24"}
+def _xml_text(item, *names):
+    """XML Element에서 여러 태그명 중 값 반환"""
+    for name in names:
+        el = item.find(name)
+        if el is not None and el.text:
+            return el.text.strip()
+    return ""
 
-    else:  # html
-        row = item
-        # viewPblancSeq 추출
-        a_tags = row.find_all("a", href=True)
-        seq_m = None
-        title = ""
-        url = ""
-        for a in a_tags:
-            href = a.get("href", "")
-            m = re.search(r"viewPblancSeq=(\d+)", href)
-            if m:
-                seq_m = m
-                title = a.get_text(strip=True) or title
-                url = (SMES_BASE + href) if href.startswith("/") else href
-                break
-        if not seq_m: return None
-        raw_id = seq_m.group(1)
-        if not title or len(title) < 3:
-            title = row.get_text(" ", strip=True)[:100]
+def normalize_smes(item):
+    # dict(JSON) 와 XML Element 양쪽 대응
+    if isinstance(item, dict):
+        get = lambda *ks: next((str(item[k]).strip() for k in ks
+                                if item.get(k) not in (None, "", "null")), "")
+    else:
+        get = lambda *ks: _xml_text(item, *ks)
 
-        texts = row.get_text(" ", strip=True)
-        # 날짜 패턴: YYYY-MM-DD 또는 YYYY.MM.DD
-        date_matches = re.findall(r"\d{4}[-./]\d{2}[-./]\d{2}", texts)
-        dates = [parse_date(d) for d in date_matches if parse_date(d)]
-        reg_date = dates[0] if dates else ""
-        deadline = dates[-1] if len(dates) > 1 else ""
+    title  = get("pblancNm", "title", "bsnsNm", "sj", "pbancNm")
+    raw_id = get("pblancId", "id", "seq", "pblancSeq", "bsnsSeq", "pbancSn")
+    if not title:
+        return None
+    if not raw_id:
+        raw_id = str(abs(hash(title)))[:12]
 
-        # 기관명: 날짜/제목 아닌 짧은 텍스트
-        STATUS = {"접수중","마감","접수예정","종료","전체","상세보기"}
-        parts = [t for t in re.split(r"\s{2,}|\|", texts)
-                 if t and t not in STATUS
-                 and not re.search(r"\d{4}[-./]\d{2}", t)
-                 and t != title and 2 < len(t) < 30]
-        org = parts[0] if parts else "중소벤처24"
+    org      = get("excInsttNm", "jrsdInsttNm", "instNm", "wrterNm", "cntcInsttNm") or "중소벤처기업부"
+    reg_date = parse_date(get("rgtrDt", "regDt", "creatDt", "frstRegistDt", "pblancDe", "ntcbgnde"))
+    deadline = parse_date(get("reqstEndDe", "rceptEndDe", "endDe", "aplyEndDt", "ntcendde"))
+    detail   = get("pblancUrl", "detailUrl", "url", "link", "rfrncUrl")
+    if detail.startswith("/"):
+        detail = "https://www.smes.go.kr" + detail
+    if not detail and raw_id.isdigit():
+        detail = f"https://www.smes.go.kr/main/sportsBsnsPolicy/view?viewPblancSeq={raw_id}"
 
-        return {"id": f"SMES-{raw_id}", "title": title[:200], "org": org,
-                "url": url or f"{SMES_BASE}/main/sportsBsnsPolicy/view?viewPblancSeq={raw_id}",
-                "reg_date": reg_date, "deadline": deadline,
-                "region": detect_region(org, title),
-                "fields": detect_fields(title), "source": "소상공인24"}
+    return {"id": f"SMES-{raw_id}", "title": title, "org": org,
+            "url": detail, "reg_date": reg_date, "deadline": deadline,
+            "region": detect_region(org, title),
+            "fields": detect_fields(title), "source": "소상공인24"}
 
 def collect_smes():
-    mode, raw = fetch_smes()
-    if mode == "none": return []
-    return [n for n in (normalize_smes(mode, r) for r in raw) if n]
+    raw = fetch_smes()
+    return [n for n in (normalize_smes(r) for r in raw) if n]
+
 
 # ==================================================================
 # 수집 공통 처리
