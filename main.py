@@ -331,6 +331,14 @@ def _ntis_html(max_pages=3):
             for row in rows:
                 cols = row.find_all("td")
                 if len(cols) < 2: continue
+                # roRndUid 링크가 있는 실제 공고 행만 수집
+                row_str = str(row)
+                if "roRndUid" not in row_str:
+                    continue
+                # roRndUid 번호 추출 가능한지 확인
+                uid_check = re.search(r"roRndUid[=,]+(\d+)", row_str)
+                if not uid_check:
+                    continue
                 items.append({"_row": row, "_cols": cols, "_col_idx": dict(col_idx)})
         except Exception as e:
             print(f"  [NTIS-HTML] 페이지 {page} 실패: {e}")
@@ -368,14 +376,17 @@ def _norm_html(item):
     url = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
 
     # 기관명
+    STATUS_WORDS = {"접수중","마감","접수예정","접수마감","공고중","종료","준비중","전체"}
     org = ""
     if "org" in col_idx and col_idx["org"] < len(texts):
         org = texts[col_idx["org"]]
-    if not org:
+    if not org or org in STATUS_WORDS:
         candidates = [t for t in texts
                       if t and t != title
+                      and t not in STATUS_WORDS
                       and not re.search(r"\d{4}", t)
-                      and len(t) < 30]
+                      and not re.search(r"^(접수|마감|공고|종료|전체)", t)
+                      and 2 < len(t) < 30]
         if candidates: org = candidates[0]
 
     # 날짜: 헤더 인덱스 → 텍스트 전체 스캔
