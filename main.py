@@ -732,72 +732,84 @@ SMES_AJAX_URLS = [
 ]
 
 def fetch_smes():
-    """중소벤처기업부 사업공고 - 공공데이터포털 REST API (XML)"""
+    """중소벤처기업부 사업공고 - 공공데이터포털 getbizList_v2 (정확한 명세)"""
     if not DATA_GO_KR_KEY:
         print("  [소상공인24] DATA_GO_KR_KEY 없음 — 건너뜁니다.")
         return []
 
-    # 공공데이터포털 표준 엔드포인트 후보
-    endpoints = [
-        "https://apis.data.go.kr/1421000/mssBizService/getbizList",
-        "https://apis.data.go.kr/1421000/mssBizService/getBizList",
-        "http://apis.data.go.kr/1421000/mssBizService/getbizList",
-    ]
+    url = "https://apis.data.go.kr/1421000/mssBizService_v2/getbizList_v2"
+    # 최근 등록분만: startDate ~ endDate (공고등록일 기준)
+    end_dt   = datetime.now()
+    start_dt = end_dt - timedelta(days=DAYS_BACK + 4)  # 여유롭게 +4일
     items = []
-    for base in endpoints:
+
+    for attempt in range(1, MAX_RETRY + 1):
         try:
-            resp = requests.get(base, params={
+            resp = requests.get(url, params={
                 "serviceKey": DATA_GO_KR_KEY,
                 "pageNo": "1",
                 "numOfRows": "100",
-                "type": "json",
+                "startDate": start_dt.strftime("%Y-%m-%d"),
+                "endDate":   end_dt.strftime("%Y-%m-%d"),
             }, headers=BROWSER_HEADERS, timeout=40)
-            if resp.status_code != 200:
-                print(f"  [소상공인24] {base} -> HTTP {resp.status_code}")
-                continue
-            ctype = resp.headers.get("Content-Type", "")
-            # JSON 우선 시도
-            if "json" in ctype or resp.text.strip().startswith("{"):
-                try:
-                    data = resp.json()
-                    body = data.get("response", {}).get("body", {})
-                    rows = body.get("items", {})
-                    if isinstance(rows, dict):
-                        rows = rows.get("item", [])
-                    if isinstance(rows, dict):
-                        rows = [rows]
-                    if rows:
-                        print(f"  [소상공인24] JSON 성공: {len(rows)}건")
-                        print(f"  [소상공인24] 첫 공고 키: {list(rows[0].keys())}")
-                        return rows
-                except Exception:
-                    pass
-            # XML 파싱
-            try:
-                root = ET.fromstring(resp.content)
-                # 에러 메시지 확인
-                err = root.find(".//errMsg")
-                auth = root.find(".//returnAuthMsg")
-                if err is not None or auth is not None:
-                    msg = (err.text if err is not None else "") + " " + (auth.text if auth is not None else "")
-                    print(f"  [소상공인24] API 오류: {msg.strip()}")
-                    if "SERVICE_KEY" in msg or "인증" in msg:
-                        print("  [소상공인24] 인증키 문제 — 승인/키값 확인 필요")
-                    continue
-                xml_items = root.findall(".//item")
-                if xml_items:
-                    print(f"  [소상공인24] XML 성공: {len(xml_items)}건")
-                    return xml_items
-            except ET.ParseError:
-                print(f"  [소상공인24] {base} 응답이 XML/JSON 아님. 앞 300자: {resp.text[:300]}")
-        except Exception as e:
-            print(f"  [소상공인24] {base} 실패: {type(e).__name__}: {str(e)[:100]}")
+            break
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            if attempt == MAX_RETRY:
+                print(f"  [소상공인24] 접속 실패 — 건너뜁니다.")
+                return []
+            print(f"  [소상공인24] 재시도 {attempt}/{MAX_RETRY}...")
+            time.sleep(10)
 
-    print("  [소상공인24] 모든 엔드포인트 실패 — 건너뜁니다.")
-    return []
+    if resp.status_code != 200:
+        print(f"  [소상공인24] HTTP {resp.status_code}: {resp.text[:200]}")
+        return []
+
+    # JSON 우선, 실패 시 XML
+    text = resp.text.strip()
+    if text.startswith("{"):
+        try:
+            data = resp.json()
+            body = data.get("response", {}).get("body", {})
+            rows = body.get("items", {})
+            if isinstance(rows, dict):
+                rows = rows.get("item", [])
+            if isinstance(rows, dict):
+                rows = [rows]
+            if rows:
+                print(f"  [소상공인24] JSON 성공: {len(rows)}건")
+                return rows
+            else:
+                # 헤더 메시지 확인
+                header = data.get("response", {}).get("header", {})
+                print(f"  [소상공인24] 데이터 0건. 응답: {header}")
+                return []
+        except Exception as e:
+            print(f"  [소상공인24] JSON 파싱 실패: {e}")
+
+    # XML 파싱
+    try:
+        root = ET.fromstring(resp.content)
+        # 인증/오류 메시지
+        for tag in [".//returnAuthMsg", ".//errMsg", ".//resultMsg", ".//cmmMsgHeader/returnAuthMsg"]:
+            el = root.find(tag)
+            if el is not None and el.text:
+                print(f"  [소상공인24] API 메시지: {el.text}")
+        xml_items = root.findall(".//item")
+        if xml_items:
+            print(f"  [소상공인24] XML 성공: {len(xml_items)}건")
+            return xml_items
+        # resultCode 확인
+        rc = root.find(".//resultCode")
+        if rc is not None:
+            print(f"  [소상공인24] resultCode={rc.text}")
+        print(f"  [소상공인24] 데이터 0건 (최근 {DAYS_BACK+4}일 이내 등록 공고 없음일 수 있음)")
+        return []
+    except ET.ParseError:
+        print(f"  [소상공인24] 응답 파싱 불가. 앞 300자: {resp.text[:300]}")
+        return []
 
 def _xml_text(item, *names):
-    """XML Element에서 여러 태그명 중 값 반환"""
     for name in names:
         el = item.find(name)
         if el is not None and el.text:
@@ -805,31 +817,33 @@ def _xml_text(item, *names):
     return ""
 
 def normalize_smes(item):
-    # dict(JSON) 와 XML Element 양쪽 대응
     if isinstance(item, dict):
         get = lambda *ks: next((str(item[k]).strip() for k in ks
                                 if item.get(k) not in (None, "", "null")), "")
     else:
         get = lambda *ks: _xml_text(item, *ks)
 
-    title  = get("pblancNm", "title", "bsnsNm", "sj", "pbancNm")
-    raw_id = get("pblancId", "id", "seq", "pblancSeq", "bsnsSeq", "pbancSn")
+    # 정확한 응답 필드명 (명세 확인 완료)
+    title  = get("title")
+    raw_id = get("itemId")
     if not title:
         return None
     if not raw_id:
         raw_id = str(abs(hash(title)))[:12]
 
-    org      = get("excInsttNm", "jrsdInsttNm", "instNm", "wrterNm", "cntcInsttNm") or "중소벤처기업부"
-    reg_date = parse_date(get("rgtrDt", "regDt", "creatDt", "frstRegistDt", "pblancDe", "ntcbgnde"))
-    deadline = parse_date(get("reqstEndDe", "rceptEndDe", "endDe", "aplyEndDt", "ntcendde"))
-    detail   = get("pblancUrl", "detailUrl", "url", "link", "rfrncUrl")
-    if detail.startswith("/"):
-        detail = "https://www.smes.go.kr" + detail
-    if not detail and raw_id.isdigit():
-        detail = f"https://www.smes.go.kr/main/sportsBsnsPolicy/view?viewPblancSeq={raw_id}"
+    org      = get("writerName") or "중소벤처기업부"
+    reg_date = ""   # 등록일 필드는 응답에 없음 (검색조건으로만 사용)
+    start_d  = parse_date(get("applicationStartDate"))
+    deadline = parse_date(get("applicationEndDate"))
+    # 등록일 대체: 접수시작일을 등록일로 사용
+    reg_date = start_d
+
+    url = get("viewUrl")
+    if url.startswith("/"):
+        url = "https://www.smes.go.kr" + url
 
     return {"id": f"SMES-{raw_id}", "title": title, "org": org,
-            "url": detail, "reg_date": reg_date, "deadline": deadline,
+            "url": url, "reg_date": reg_date, "deadline": deadline,
             "region": detect_region(org, title),
             "fields": detect_fields(title), "source": "소상공인24"}
 
