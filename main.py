@@ -831,11 +831,12 @@ def normalize_smes(item):
     if not raw_id:
         raw_id = str(abs(hash(title)))[:12]
 
-    org      = get("writerName") or "중소벤처기업부"
-    reg_date = ""   # 등록일 필드는 응답에 없음 (검색조건으로만 사용)
+    # writerName은 담당자 이름이므로 기관명으로 쓰지 않음.
+    # 이 API는 중소벤처기업부 사업공고이므로 기관명 고정.
+    org      = "중소벤처기업부"
     start_d  = parse_date(get("applicationStartDate"))
     deadline = parse_date(get("applicationEndDate"))
-    # 등록일 대체: 접수시작일을 등록일로 사용
+    # 등록일 필드가 응답에 없어 접수시작일을 등록일로 사용
     reg_date = start_d
 
     url = get("viewUrl")
