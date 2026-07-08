@@ -480,24 +480,50 @@ SMTECH_BASE     = "https://www.smtech.go.kr"
 SMTECH_LIST_URL = "https://www.smtech.go.kr/front/ifg/no/notice1List.do"
 SMTECH_AJAX_URL = "https://www.smtech.go.kr/front/ifg/no/notice1ListAjax.do"
 
+def _make_ssl_session(base_url):
+    """SSL 문제 우회용 세션 (TLS 버전 강제 + 검증 유지)"""
+    import ssl
+    from requests.adapters import HTTPAdapter
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        class TLSAdapter(HTTPAdapter):
+            def init_poolmanager(self, *a, **kw):
+                from urllib3.util.ssl_ import create_urllib3_context
+                kw["ssl_context"] = ctx
+                super().init_poolmanager(*a, **kw)
+        sess = requests.Session()
+        sess.mount("https://", TLSAdapter())
+    except Exception:
+        sess = requests.Session()
+    sess.headers.update({**BROWSER_HEADERS, "Referer": base_url})
+    return sess
+
 def fetch_smtech():
-    """SMTECH 사업공고 목록 Ajax or HTML 파싱"""
-    sess = requests.Session()
-    sess.headers.update({**BROWSER_HEADERS,
-        "Referer": SMTECH_LIST_URL,
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    })
+    """SMTECH 사업공고 목록 Ajax or HTML 파싱 (SSL 우회 + 재시도)"""
     items = []
     # 방법1: Ajax JSON
     try:
+        sess = _make_ssl_session(SMTECH_LIST_URL)
+        sess.headers.update({
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        })
         for page in range(1, 6):
-            resp = sess.post(SMTECH_AJAX_URL, data={
-                "pageIndex": str(page), "pageUnit": "20",
-                "searchCondition": "", "searchKeyword": "",
-                "bCd": "", "sFld": "", "sStr": "",
-            }, timeout=30)
+            for attempt in range(1, MAX_RETRY + 1):
+                try:
+                    resp = sess.post(SMTECH_AJAX_URL, data={
+                        "pageIndex": str(page), "pageUnit": "20",
+                        "searchCondition": "", "searchKeyword": "",
+                    }, timeout=40)
+                    break
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as e:
+                    if attempt == MAX_RETRY: raise
+                    print(f"  [SMTECH-Ajax] 재시도 {attempt}/{MAX_RETRY}...")
+                    time.sleep(10)
             if resp.status_code != 200: break
             data = resp.json()
             rows = (data.get("resultList") or data.get("list")
@@ -510,30 +536,46 @@ def fetch_smtech():
             print(f"  [SMTECH] Ajax 성공: {len(items)}건")
             return ("ajax", items)
     except Exception as e:
-        print(f"  [SMTECH-Ajax] 실패: {e}")
+        print(f"  [SMTECH-Ajax] 실패: {type(e).__name__}: {e}")
 
-    # 방법2: HTML 파싱
+    # 방법2: HTML (여러 URL 후보)
     print("  [SMTECH] HTML 파싱 시도...")
-    sess.headers.update({"Accept": "text/html,application/xhtml+xml"})
+    list_urls = [
+        SMTECH_LIST_URL,
+        "https://www.smtech.go.kr/front/ifg/no/notice1List.do",
+        "https://smtech.go.kr/front/comn/main/main.do",
+    ]
     html_items = []
-    try:
-        for page in range(1, 6):
-            resp = sess.get(SMTECH_LIST_URL,
-                params={"pageIndex": str(page)}, timeout=30)
-            if resp.status_code != 200: break
+    for list_url in list_urls:
+        try:
+            sess2 = _make_ssl_session(list_url)
+            sess2.headers.update({"Accept": "text/html,application/xhtml+xml"})
+            resp = sess2.get(list_url, params={"pageIndex": "1"}, timeout=40)
+            if resp.status_code != 200:
+                print(f"  [SMTECH-HTML] {list_url} -> {resp.status_code}")
+                continue
             soup = BeautifulSoup(resp.text, "html.parser")
             rows = (soup.select("table.board_list tbody tr") or
                     soup.select("table.tbl_list tbody tr") or
                     soup.select("table tbody tr"))
-            if not rows: break
             valid = [r for r in rows if r.find("a") and len(r.find_all("td")) >= 2]
-            if not valid: break
-            html_items.extend(valid)
-        if html_items:
-            print(f"  [SMTECH] HTML 성공: {len(html_items)}건")
-            return ("html", html_items)
-    except Exception as e:
-        print(f"  [SMTECH-HTML] 실패: {e}")
+            if valid:
+                # 성공 시 나머지 페이지도 수집
+                html_items.extend(valid)
+                for page in range(2, 6):
+                    resp2 = sess2.get(list_url, params={"pageIndex": str(page)}, timeout=40)
+                    if resp2.status_code != 200: break
+                    soup2 = BeautifulSoup(resp2.text, "html.parser")
+                    rows2 = (soup2.select("table.board_list tbody tr") or
+                             soup2.select("table.tbl_list tbody tr") or
+                             soup2.select("table tbody tr"))
+                    valid2 = [r for r in rows2 if r.find("a") and len(r.find_all("td")) >= 2]
+                    if not valid2: break
+                    html_items.extend(valid2)
+                print(f"  [SMTECH] HTML 성공({list_url}): {len(html_items)}건")
+                return ("html", html_items)
+        except Exception as e:
+            print(f"  [SMTECH-HTML] {list_url} 실패: {type(e).__name__}: {str(e)[:100]}")
 
     print("  [SMTECH] 수집 실패 — 건너뜁니다.")
     return ("none", [])
@@ -606,39 +648,54 @@ SEMAS_LIST_URL = "https://www.semas.or.kr/web/board/webBoardList.kmdc"
 SEMAS_BOARD_CD = "240"   # 사업공고 게시판 코드
 
 def fetch_semas():
-    """소진공 사업공고 목록 HTML 파싱"""
-    sess = requests.Session()
-    sess.headers.update({**BROWSER_HEADERS,
-        "Referer": SEMAS_BASE,
-        "Accept": "text/html,application/xhtml+xml",
-    })
+    """소진공 사업공고 목록 HTML 파싱 (SSL 우회 + 재시도)"""
+    # 공고 게시판 URL 후보 (bCd: 240=사업공고, 380=유관공고)
+    board_candidates = [
+        {"bCd": "240", "pNm": "BOA0103"},
+        {"bCd": "380", "pNm": "BOA0101"},
+    ]
     items = []
-    try:
-        for page in range(1, 6):
-            resp = sess.get(SEMAS_LIST_URL, params={
-                "bCd": SEMAS_BOARD_CD,
-                "pNm": "BOA0103",
-                "page": str(page),
-            }, timeout=30)
-            if resp.status_code != 200: break
-            soup = BeautifulSoup(resp.text, "html.parser")
-            rows = (soup.select("table.board_list tbody tr") or
-                    soup.select("table.tbl_list tbody tr") or
-                    soup.select("table tbody tr") or
-                    soup.select(".board-list tr"))
-            valid = [r for r in rows
-                     if r.find("a") and len(r.find_all("td")) >= 2]
-            if not valid:
-                print(f"  [소진공-HTML] 페이지 {page}: 행 없음")
-                # 진단
-                if page == 1:
-                    print(f"  [소진공] HTML 앞 800자: {resp.text[:800]}")
-                break
-            items.extend(valid)
-        if items:
-            print(f"  [소진공] HTML 성공: {len(items)}건")
-    except Exception as e:
-        print(f"  [소진공] 실패: {e}")
+    for board in board_candidates:
+        try:
+            sess = _make_ssl_session(SEMAS_BASE)
+            sess.headers.update({"Accept": "text/html,application/xhtml+xml"})
+            for page in range(1, 6):
+                for attempt in range(1, MAX_RETRY + 1):
+                    try:
+                        resp = sess.get(SEMAS_LIST_URL, params={
+                            **board, "page": str(page),
+                        }, timeout=40)
+                        break
+                    except (requests.exceptions.ConnectionError,
+                            requests.exceptions.SSLError,
+                            requests.exceptions.Timeout) as e:
+                        if attempt == MAX_RETRY: raise
+                        print(f"  [소진공] 재시도 {attempt}/{MAX_RETRY} (bCd={board['bCd']})...")
+                        time.sleep(10)
+                if resp.status_code != 200:
+                    print(f"  [소진공] bCd={board['bCd']} -> HTTP {resp.status_code}")
+                    break
+                soup = BeautifulSoup(resp.text, "html.parser")
+                rows = (soup.select("table.board_list tbody tr") or
+                        soup.select("table.tbl_list tbody tr") or
+                        soup.select("table tbody tr") or
+                        soup.select(".board-list tr"))
+                valid = [r for r in rows
+                         if r.find("a") and len(r.find_all("td")) >= 2]
+                if not valid:
+                    if page == 1:
+                        print(f"  [소진공] bCd={board['bCd']} 행 없음, HTML 앞 500자:")
+                        print(f"  {resp.text[:500]}")
+                    break
+                items.extend(valid)
+            if items:
+                print(f"  [소진공] HTML 성공 (bCd={board['bCd']}): {len(items)}건")
+                return items
+        except Exception as e:
+            print(f"  [소진공] bCd={board['bCd']} 실패: {type(e).__name__}: {str(e)[:150]}")
+
+    if not items:
+        print("  [소진공] 수집 실패 — 건너뜁니다.")
     return items
 
 def normalize_semas(row):
