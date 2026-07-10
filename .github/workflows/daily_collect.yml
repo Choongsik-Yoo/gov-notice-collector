@@ -2,9 +2,12 @@ name: notice-collector
 
 on:
   schedule:
-    - cron: "0 23 * * *"
-    - cron: "40 23 * * *"
-    - cron: "20 0 * * *"
+    - cron: "5 6 * * *"
+      timezone: "Asia/Seoul"
+    - cron: "45 6 * * *"
+      timezone: "Asia/Seoul"
+    - cron: "25 7 * * *"
+      timezone: "Asia/Seoul"
   workflow_dispatch:
 
 jobs:
