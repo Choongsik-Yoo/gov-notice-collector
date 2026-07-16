@@ -10,7 +10,7 @@
   BIZINFO_API_KEY    : 기업마당 API 인증키
 """
 
-import os, re, sys, time
+import os, re, sys, time, hashlib
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -71,6 +71,10 @@ def pick(item, *keys):
             return str(v).strip()
     return ""
 
+def stable_id(text):
+    """실행할 때마다 값이 바뀌는 hash() 대신, 항상 같은 값이 나오는 MD5 해시"""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+
 def parse_date(text):
     if not text: return ""
     m = re.search(r"(\d{4})[-./년\s]?(\d{2})[-./월\s]?(\d{2})", str(text))
@@ -121,7 +125,10 @@ def notion_post(url, payload):
     raise last_err
 
 def get_existing_ids():
+    """기존 저장분의 (공고ID 집합, 출처|제목 키 집합)을 함께 수집.
+    출처|제목 키는 ID 생성 방식이 바뀌어도 같은 공고를 중복 저장하지 않기 위한 2차 안전장치."""
     ids = set()
+    keys = set()
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     payload = {"page_size": 100}
     while True:
@@ -129,14 +136,23 @@ def get_existing_ids():
         resp.raise_for_status()
         data = resp.json()
         for page in data.get("results", []):
-            prop = page.get("properties", {}).get("공고ID", {})
-            for rt in prop.get("rich_text", []):
+            props = page.get("properties", {})
+            for rt in props.get("공고ID", {}).get("rich_text", []):
                 ids.add(rt.get("plain_text", "").strip())
+            title = "".join(
+                t.get("plain_text", "")
+                for t in props.get("제목", {}).get("title", [])
+            ).strip()
+            sources = [o.get("name", "") for o in
+                       props.get("출처", {}).get("multi_select", [])]
+            for s in sources:
+                if title:
+                    keys.add(f"{s}|{title}")
         if data.get("has_more"):
             payload["start_cursor"] = data["next_cursor"]
         else:
             break
-    return ids
+    return ids, keys
 
 def create_page(n):
     props = {
@@ -373,7 +389,7 @@ def _norm_html(item):
     if not title: return None
     if not raw_id:
         m = re.search(r"roRndUid[=,]+(\d+)", str(row))
-        raw_id = m.group(1) if m else str(abs(hash(title)))
+        raw_id = m.group(1) if m else stable_id(title)
     url = f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}"
 
     # 기관명
@@ -436,7 +452,7 @@ def _norm_rss(item):
     title = tag("title"); link = tag("link"); guid = tag("guid") or link
     if not title: return None
     uid_m  = re.search(r"roRndUid=(\d+)", guid + link)
-    raw_id = uid_m.group(1) if uid_m else str(abs(hash(guid)))
+    raw_id = uid_m.group(1) if uid_m else stable_id(guid)
     url    = link if link.startswith("http") else (
              f"{NTIS_BASE}/rndgate/eg/un/ra/view.do?roRndUid={raw_id}")
     reg_date = parse_date(tag("pubDate"))
@@ -555,7 +571,7 @@ def normalize_smtech(mode, item):
         title = clean.strip() if len(clean.strip()) > 5 else ""
         if not title: return None
         # 고유ID: 제목 해시 (RMS는 URL에 ID 없음)
-        raw_id = str(abs(hash(title + start_date)))[:12]
+        raw_id = stable_id(title + start_date)
         return {"id": f"SMT-{raw_id}", "title": title[:200],
                 "org": "중소기업기술정보진흥원",
                 "url": SMTECH_RMS_URL,
@@ -598,7 +614,7 @@ def normalize_smtech(mode, item):
         title = a.get_text(strip=True)
         href  = a.get("href", "") or str(a.get("onclick", ""))
         bid_m = re.search(r"bIdx[=,]+(\d+)", href + str(row))
-        raw_id = bid_m.group(1) if bid_m else str(abs(hash(title)))
+        raw_id = bid_m.group(1) if bid_m else stable_id(title)
         url = f"{SMTECH_BASE}/front/ifg/no/notice1View.do?bIdx={raw_id}"
         texts = [c.get_text(strip=True) for c in cols]
         STATUS = {"접수중","마감","접수예정","종료","전체"}
@@ -690,7 +706,7 @@ def normalize_semas(row):
     href  = a.get("href", "") or str(a.get("onclick", ""))
     # b_idx 추출
     bid_m = re.search(r"b_idx[=,]+(\d+)", href + str(row))
-    raw_id = bid_m.group(1) if bid_m else str(abs(hash(title)))
+    raw_id = bid_m.group(1) if bid_m else stable_id(title)
     # 절대 URL
     if href.startswith("http"):
         url = href
@@ -829,7 +845,7 @@ def normalize_smes(item):
     if not title:
         return None
     if not raw_id:
-        raw_id = str(abs(hash(title)))[:12]
+        raw_id = stable_id(title)
 
     # writerName은 담당자 이름이므로 기관명으로 쓰지 않음.
     # 이 API는 중소벤처기업부 사업공고이므로 기관명 고정.
@@ -856,19 +872,102 @@ def collect_smes():
 # ==================================================================
 # 수집 공통 처리
 # ==================================================================
-def collect_source(name, notices, existing):
+def collect_source(name, notices, existing_ids, existing_keys):
     recent = [n for n in notices if is_recent(n)]
-    new    = [n for n in recent  if n["id"] not in existing]
+    new = [n for n in recent
+           if n["id"] not in existing_ids
+           and f"{n['source']}|{n['title']}" not in existing_keys]
     print(f"  정규화 {len(notices)}건 → 최근 {DAYS_BACK}일 {len(recent)}건 → 신규 {len(new)}건")
     saved = 0
     for n in new:
         if create_page(n):
             saved += 1
-            existing.add(n["id"])
+            existing_ids.add(n["id"])
+            existing_keys.add(f"{n['source']}|{n['title']}")
             print(f"    [저장] {n.get('reg_date','')} | {n['title'][:45]}")
         time.sleep(0.4)
     print(f"  [{name}] 저장 완료: {saved}건")
     return saved
+
+
+# ==================================================================
+# 마감 지난 공고 정리 (휴지통 이동)
+# ==================================================================
+def archive_expired():
+    """
+    접수마감일이 '어제까지'인 공고를 노션 휴지통으로 이동.
+    - 날짜(YYYY-MM-DD)로 명확히 해석되는 것만 대상.
+    - '모집 완료시', '예산 소진 시', 빈 값 등 애매한 것은 건드리지 않음(안전 우선).
+    - 오늘이 마감일인 공고는 아직 유효하므로 남겨둠.
+    - 삭제가 아니라 휴지통 이동이라 노션에서 30일간 복구 가능.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    print("[정리] 마감 지난 공고 확인 중...")
+
+    # 전체 페이지에서 접수마감일 텍스트를 읽어 만료 여부 판단
+    to_archive = []
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    payload = {"page_size": 100}
+    while True:
+        resp = notion_post(url, payload)
+        resp.raise_for_status()
+        data = resp.json()
+        for page in data.get("results", []):
+            props = page.get("properties", {})
+            deadline_text = "".join(
+                rt.get("plain_text", "")
+                for rt in props.get("접수마감일", {}).get("rich_text", [])
+            ).strip()
+            # 순수 날짜 형식(YYYY-MM-DD)만 판정 대상
+            m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", deadline_text)
+            if not m:
+                continue  # 애매한 값은 건너뜀
+            if deadline_text < today:  # 문자열 비교로도 날짜 대소 정확
+                title = "".join(
+                    t.get("plain_text", "")
+                    for t in props.get("제목", {}).get("title", [])
+                ).strip()
+                to_archive.append((page["id"], deadline_text, title))
+        if data.get("has_more"):
+            payload["start_cursor"] = data["next_cursor"]
+        else:
+            break
+
+    if not to_archive:
+        print("  마감 지난 공고 없음 — 정리할 것이 없습니다.")
+        return 0
+
+    print(f"  마감 지난 공고: {len(to_archive)}건 → 휴지통 이동")
+    archived = 0
+    for page_id, dl, title in to_archive:
+        try:
+            r = notion_post_patch(page_id, {"archived": True})
+            if r.status_code == 200:
+                archived += 1
+                print(f"    [정리] 마감 {dl} | {title[:40]}")
+        except Exception as e:
+            print(f"    [실패] {title[:30]}: {e}")
+        time.sleep(0.4)
+    print(f"  정리 완료: {archived}건 (노션 휴지통에서 30일간 복구 가능)")
+    return archived
+
+
+def notion_post_patch(page_id, payload):
+    """페이지 수정(PATCH)용 - 재시도 포함"""
+    last_err = None
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            resp = requests.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=NOTION_HEADERS, json=payload, timeout=60)
+            if resp.status_code in (429, 500, 502, 503):
+                raise requests.exceptions.ConnectionError(f"노션 오류 {resp.status_code}")
+            return resp
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last_err = e
+            time.sleep(RETRY_WAIT)
+    raise last_err
 
 
 # ==================================================================
@@ -888,38 +987,41 @@ def main():
     print(f"  지원사업 공고 자동 수집  {datetime.now():%Y-%m-%d %H:%M}")
     print(f"{'='*55}")
 
-    existing = get_existing_ids()
-    print(f"노션 기존 저장분: {len(existing)}건\n")
+    existing_ids, existing_keys = get_existing_ids()
+    print(f"노션 기존 저장분: {len(existing_ids)}건\n")
 
     total = 0
 
     print("[1단계] 기업마당")
     raw_biz = fetch_bizinfo()
     notices_biz = [n for n in (normalize_bizinfo(i) for i in raw_biz) if n]
-    total += collect_source("기업마당", notices_biz, existing)
+    total += collect_source("기업마당", notices_biz, existing_ids, existing_keys)
 
     print()
     print("[2단계] NTIS 국가R&D통합공고")
     notices_ntis = fetch_ntis()
-    total += collect_source("NTIS", notices_ntis, existing)
+    total += collect_source("NTIS", notices_ntis, existing_ids, existing_keys)
 
     print()
     print("[3단계] SMTECH 중소기업기술정보진흥원")
     notices_smt = collect_smtech()
-    total += collect_source("SMTECH", notices_smt, existing)
+    total += collect_source("SMTECH", notices_smt, existing_ids, existing_keys)
 
     print()
     print("[3단계] 소진공 소상공인시장진흥공단")
     notices_semas = collect_semas()
-    total += collect_source("소진공", notices_semas, existing)
+    total += collect_source("소진공", notices_semas, existing_ids, existing_keys)
 
     print()
     print("[4단계] 소상공인24 (중소벤처24)")
     notices_smes = collect_smes()
-    total += collect_source("소상공인24", notices_smes, existing)
+    total += collect_source("소상공인24", notices_smes, existing_ids, existing_keys)
+
+    print()
+    expired = archive_expired()
 
     print(f"\n{'='*55}")
-    print(f"  전체 신규 저장: {total}건  완료")
+    print(f"  전체 신규 저장: {total}건  |  마감 정리: {expired}건  완료")
     print(f"{'='*55}\n")
 
 if __name__ == "__main__":
